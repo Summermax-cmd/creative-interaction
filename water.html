@@ -328,12 +328,13 @@ function buildSimTargets() {
 }
 if (!buildSimTargets()) { /* error shown */ }
 
+const isMobile = /iPhone|iPad|iPod|Android/i.test(navigator.userAgent);
 function resize() {
-  const dpr = Math.min(window.devicePixelRatio || 1, 2);
+  const dpr = Math.min(window.devicePixelRatio || 1, isMobile ? 1.25 : 2);
   cv.width  = Math.floor(window.innerWidth  * dpr);
   cv.height = Math.floor(window.innerHeight * dpr);
   // sim resolution scales with screen but capped for perf
-  const target = 320;
+  const target = isMobile ? 224 : 320;
   const ar = cv.width / cv.height;
   let w, h;
   if (ar >= 1) { w = target; h = Math.round(target / ar); }
@@ -382,8 +383,15 @@ async function initCamera() {
 
 // MediaPipe: 5 fingertips per hand × 2 hands = up to 10
 const FINGER_LM = [4, 8, 12, 16, 20];
-let fingers     = new Array(10).fill(0).map(() => ({ x:-9, y:-9, active:0 }));
-let prevFingers = new Array(10).fill(0).map(() => ({ x:-9, y:-9, active:0 }));
+// fingers/prevFingers are *display* positions used by the sim — updated every
+// render frame by smoothing toward fingerTargets (which MediaPipe / touch fill).
+// MediaPipe runs at ~15 fps on mobile while we render at ~60 fps; without
+// smoothing the capsule sits still between MediaPipe results and ripples lag.
+let fingers       = new Array(10).fill(0).map(() => ({ x:-9, y:-9, active:0 }));
+let prevFingers   = new Array(10).fill(0).map(() => ({ x:-9, y:-9, active:0 }));
+let fingerTargets = new Array(10).fill(0).map(() => ({ x:-9, y:-9, active:0 }));
+let mpTargets     = new Array(10).fill(0).map(() => ({ x:-9, y:-9 }));
+let mpCount = 0;
 let fingerCount = 0;
 let mpHands = null;
 
@@ -407,34 +415,22 @@ async function pumpHands() {
   loop();
 }
 function onHandsResults(res) {
-  // copy current to prev
-  for (let i = 0; i < 10; i++) {
-    prevFingers[i].x = fingers[i].x;
-    prevFingers[i].y = fingers[i].y;
-    prevFingers[i].active = fingers[i].active;
-  }
-  fingerCount = 0;
+  let n = 0;
   if (res.multiHandLandmarks) {
     for (const lms of res.multiHandLandmarks) {
       for (const lmIdx of FINGER_LM) {
-        if (fingerCount >= 10) break;
+        if (n >= 10) break;
         const lm = lms[lmIdx];
         // mirror only when front cam (auto-mirror flag drives both shader and finger uv)
-        let x = mirrorOn > 0.5 ? (1.0 - lm.x) : lm.x;
-        let y = 1.0 - lm.y; // GL texture origin
-        const f = fingers[fingerCount];
-        // first appearance: snap prev to curr (avoid huge capsule)
-        if (f.active < 0.5) {
-          prevFingers[fingerCount].x = x;
-          prevFingers[fingerCount].y = y;
-        }
-        f.x = x; f.y = y; f.active = 1.0;
-        fingerCount++;
+        const x = mirrorOn > 0.5 ? (1.0 - lm.x) : lm.x;
+        const y = 1.0 - lm.y; // GL texture origin
+        mpTargets[n].x = x;
+        mpTargets[n].y = y;
+        n++;
       }
     }
   }
-  // mark slots beyond fingerCount as inactive
-  for (let i = fingerCount; i < 10; i++) fingers[i].active = 0.0;
+  mpCount = n;
 }
 
 // =============================================================
@@ -445,22 +441,52 @@ function uvFromEvent(x, y) {
   const r = cv.getBoundingClientRect();
   return [ (x - r.left) / r.width, 1.0 - (y - r.top) / r.height ];
 }
-function injectTouches() {
-  // append touch points after MediaPipe fingers if room
-  for (const t of touchPoints) {
-    if (fingerCount >= 10) break;
-    const f = fingers[fingerCount];
-    if (f.active < 0.5) {
-      prevFingers[fingerCount].x = t.x;
-      prevFingers[fingerCount].y = t.y;
-    } else {
-      prevFingers[fingerCount].x = f.x;
-      prevFingers[fingerCount].y = f.y;
-    }
-    f.x = t.x; f.y = t.y; f.active = 1.0;
-    fingerCount++;
+// Compose the live target list (MediaPipe tips + touch points) and smooth
+// the displayed finger positions toward it. Runs every render frame, so the
+// capsule SDF traces a continuous path between MediaPipe updates.
+function updateFingers() {
+  let count = 0;
+  for (let i = 0; i < mpCount && count < 10; i++) {
+    fingerTargets[count].x = mpTargets[i].x;
+    fingerTargets[count].y = mpTargets[i].y;
+    fingerTargets[count].active = 1.0;
+    count++;
   }
-  for (let i = fingerCount; i < 10; i++) fingers[i].active = 0.0;
+  for (const t of touchPoints) {
+    if (count >= 10) break;
+    fingerTargets[count].x = t.x;
+    fingerTargets[count].y = t.y;
+    fingerTargets[count].active = 1.0;
+    count++;
+  }
+  for (let i = count; i < 10; i++) fingerTargets[i].active = 0.0;
+
+  const k = 0.4;
+  for (let i = 0; i < 10; i++) {
+    const t = fingerTargets[i];
+    const f = fingers[i];
+    if (t.active > 0.5) {
+      // shift current → prev for capsule continuity
+      prevFingers[i].x = f.x;
+      prevFingers[i].y = f.y;
+      prevFingers[i].active = f.active;
+      if (f.active < 0.5) {
+        // first appearance: snap so capsule doesn't streak from origin
+        f.x = t.x; f.y = t.y;
+        prevFingers[i].x = t.x;
+        prevFingers[i].y = t.y;
+        prevFingers[i].active = 1.0;
+      } else {
+        f.x += (t.x - f.x) * k;
+        f.y += (t.y - f.y) * k;
+      }
+      f.active = 1.0;
+    } else {
+      f.active = 0.0;
+      prevFingers[i].active = 0.0;
+    }
+  }
+  fingerCount = count;
 }
 
 window.addEventListener('mousedown', e => {
@@ -593,7 +619,7 @@ function display() {
 function frame() {
   if (started) {
     uploadCamera();
-    injectTouches();
+    updateFingers();
     simStep();
     display();
   }
